@@ -56,9 +56,8 @@
                         :corda_tx_id)
         service-hub (.getServices node-a)
         _corda-tx (.getTransaction (.getValidatedTransactions service-hub)
-                                   (SecureHash/parse corda-tx-id))]
+                                   (SecureHash/parse corda-tx-id))]))
 
-    ))
 
 (defmulti tx-row->tx
   (fn [tx-row dialect]
@@ -177,4 +176,4 @@
   [{:keys [dialect ^AppServiceHub service-hub] :as opts}]
   (setup-tx-schema! dialect (.jdbcSession service-hub))
   (map->CordaTxLog (assoc opts
-                          :subscriber-handler (tx-sub/->notifying-subscriber-handler (latest-submitted-tx opts)))))
+                          :subscriber-handler (tx-sub/->subscriber-handler {:poll-sleep-duration nil}))))

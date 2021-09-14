@@ -69,7 +69,7 @@
          (reset! last-tx (xt/submit-tx *api* [[::xt/put {:xt/id (keyword (str n))}]]))))
 
       (time
-       (xt/await-tx *api* last-tx nil))))
+       (xt/await-tx *api* @last-tx nil))))
   (t/is true))
 
 (t/deftest test-ingest-bench
