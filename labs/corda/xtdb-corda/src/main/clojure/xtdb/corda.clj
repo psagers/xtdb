@@ -176,4 +176,4 @@
   [{:keys [dialect ^AppServiceHub service-hub] :as opts}]
   (setup-tx-schema! dialect (.jdbcSession service-hub))
   (map->CordaTxLog (assoc opts
-                          :subscriber-handler (tx-sub/->subscriber-handler {:poll-sleep-duration nil}))))
+                          :subscriber-handler (tx-sub/->notifying-subscriber-handler (latest-submitted-tx opts)))))

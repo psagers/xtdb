@@ -99,7 +99,7 @@
         (xio/->cursor (fn []) (tx-log after-tx-id)))))
 
   (subscribe [this after-tx-id f]
-    (tx-sub/handle-subscriber subscriber-handler this after-tx-id f))
+    (tx-sub/handle-notifying-subscriber subscriber-handler this after-tx-id f))
 
   Closeable
   (close [_]
@@ -125,4 +125,4 @@
   [{:keys [kv-store]}]
   (map->KvTxLog {:tx-submit-executor (bounded-solo-thread-pool 16 (xio/thread-factory "xtdb-standalone-submit-tx"))
                  :kv-store kv-store
-                 :subscriber-handler (tx-sub/->subscriber-handler {:poll-sleep-duration nil})}))
+                 :subscriber-handler (tx-sub/->notifying-subscriber-handler (latest-submitted-tx kv-store))}))

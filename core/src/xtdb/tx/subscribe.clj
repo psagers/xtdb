@@ -1,16 +1,17 @@
 (ns xtdb.tx.subscribe
-  (:require [xtdb.api :as xt]
+  (:require [clojure.tools.logging :as log]
+            [xtdb.api :as xt]
             [xtdb.db :as db]
             [xtdb.io :as xio])
   (:import xtdb.api.ICursor
            java.time.Duration
-           [java.util.concurrent CompletableFuture]
+           [java.util.concurrent CompletableFuture ScheduledFuture ScheduledThreadPoolExecutor TimeUnit]
            java.util.function.BiConsumer))
 
 (def ^java.util.concurrent.ThreadFactory subscription-thread-factory
   (xio/thread-factory "xtdb-tx-subscription"))
 
-(defn completable-thread [f]
+(defn ^CompletableFuture completable-thread [f]
   (let [fut (CompletableFuture.)
         thread (doto (.newThread subscription-thread-factory
                                  (fn []
@@ -38,23 +39,6 @@
         :else tx-id))))
 
 
-(defn through-tx-id
-  "Returns a transducer that passes through tx maps up to and including one
-  with last-tx-id. You can almost do this with take-while, except that
-  take-while won't terminate until it sees a non-matching value (which may
-  never arrive if no one is submitting txs). This terminates as soon as it sees
-  final-tx-id."
-  [final-tx-id]
-  (fn [rf]
-    (fn ([] (rf))
-        ([result] (rf result))
-        ([result {::xt/keys [tx-id] :as tx}]
-         (cond
-           (< tx-id final-tx-id) (rf result tx)
-           (= tx-id final-tx-id) (ensure-reduced (rf result tx))
-           :else (ensure-reduced result))))))
-
-
 (defprotocol PLatestTxId
   "A synchronized box that tracks the latest submitted tx-id."
   (set-latest-tx-id! [this ^Long new-tx-id]
@@ -65,7 +49,9 @@
                   than after-tx-id. Returns the latest tx-id."))
 
 
-;; Essentially a tx-id behind a Lock/Condition.
+;; Essentially a tx-id behind a Lock/Condition. This plays nicely with
+;; completable threads, as interrupting the thread will pop us out of
+;; Object.wait() with an InterruptedException.
 (deftype LatestTxId [^:volatile-mutable tx-id]
   PLatestTxId
   (set-latest-tx-id! [this new-tx-id]
@@ -81,21 +67,24 @@
         (if (> tx-id after-tx-id)
          tx-id
          (do
-           (.wait this 1000)
-           (if (.isInterrupted (Thread/currentThread))
-             tx-id
-             (recur after-tx-id))))))))
+           (.wait this)
+           (recur after-tx-id)))))))
 
 
 (defn ->latest-tx-id
-  [tx-id]
-  (->LatestTxId tx-id))
+  ([]
+   (->latest-tx-id -1))
+  ([tx-id]
+   (->LatestTxId tx-id)))
 
 
 ;; Note that some of these methods take a tx-log argument. Logically, this
 ;; should be a property of the subscriber handler, but this creates circular
-;; references in practice. Passing different tx-log values to the same
+;; references in practice. Passing different tx-log objects to the same
 ;; subscriber handler will result in undefined behavior.
+;;
+;; XXX: Can we not use a weak reference or something? Having tx-log in the
+;; parameter lists is weird in principle and awkward in practice.
 (defprotocol PSubscriberHandler
   (handle-subscriber [this tx-log after-tx-id f]
                      "Starts a thread that will call f with tx records as they
@@ -115,44 +104,69 @@
                 welcome to set up their own polling loops if they so desire."))
 
 
-(defn- polling-fn [handler tx-log ^Duration poll-sleep-duration]
-  (fn [^CompletableFuture fut]
-    (loop []
-      (Thread/sleep (.toMillis poll-sleep-duration))
-      (cond
-        (.isDone fut) nil
-        (Thread/interrupted) (throw (InterruptedException.))
-        :else (do (poll-for-tx! handler tx-log)
-                  (recur))))))
+(defprotocol PPollTimer
+  (acquire-timer! [this handler tx-log opts]
+                  "Ensures that this polling timer is running. Returns a lease
+                  value that must be presented later to release-timer!.")
+
+  (release-timer! [this lease]
+                  "Balances a previous call to acquire-timer! When all leases
+                  are released, the timer is canceled."))
 
 
-(defrecord SubscriberHandler [!latest-tx-id opts]
+;; In pure Clojure, I might do this with an agent. XT seems to prefer Java
+;; concurrency primitives, so we'll do it the Java way.
+(deftype PollTimer [^ScheduledThreadPoolExecutor executor, ^:volatile-mutable leases, ^:volatile-mutable ^ScheduledFuture fut]
+  PPollTimer
+  (acquire-timer! [this handler tx-log {:keys [^Duration poll-sleep-duration]}]
+    (locking this
+      (let [lease (gensym "poll-lease-")]
+        (set! leases (conj leases lease))
+        (when (nil? fut)
+          (set! fut (.scheduleWithFixedDelay executor
+                                             (reify Runnable (run [_] (poll-for-tx! handler tx-log)))
+                                             (.toMillis poll-sleep-duration)
+                                             (.toMillis poll-sleep-duration)
+                                             TimeUnit/MILLISECONDS)))
+        lease)))
+
+  (release-timer! [this lease]
+    (locking this
+      (if-not (leases lease)
+        (log/warn (str "Timer lease not found: " lease))
+        (do
+          (set! leases (disj leases lease))
+          (when (and (empty? leases) (some? fut))
+            (.cancel fut false)
+            (set! fut nil)))))))
+
+
+(defn ->poll-timer []
+  (->PollTimer (ScheduledThreadPoolExecutor. 1) #{} nil))
+
+
+(defrecord SubscriberHandler [!latest-tx-id !poll-timer opts]
   PSubscriberHandler
   (handle-subscriber [this tx-log after-tx-id f]
     (let [{:keys [poll-sleep-duration]} opts
-
-          ;; Optionally enable the polling thread.
-          poll-fut (when poll-sleep-duration
-                     (completable-thread (polling-fn this tx-log poll-sleep-duration)))
-
           ;; Start processing txs.
           fut (completable-thread
                 (fn [^CompletableFuture fut]
                   (loop [after-tx-id after-tx-id]
-                    (let [latest-tx-id (wait-for-tx-id !latest-tx-id after-tx-id)
-                          last-tx-id (with-open [^ICursor log (db/open-tx-log tx-log after-tx-id)]
+                    (wait-for-tx-id !latest-tx-id after-tx-id)
+                    (let [last-tx-id (with-open [^ICursor log (db/open-tx-log tx-log after-tx-id)]
                                          (reduce (tx-handler fut f)
                                                  after-tx-id
-                                                 (eduction (through-tx-id latest-tx-id)
-                                                           (iterator-seq log))))]
+                                                 (iterator-seq log)))]
                        (cond
                          (.isDone fut) nil
                          (Thread/interrupted) (throw (InterruptedException.))
                          :else (recur last-tx-id))))))]
 
-      ;; Make sure to tear down the polling thread with the main one.
-      (when poll-fut
-        (.whenComplete fut (reify BiConsumer (accept [_ v e] (.complete poll-fut nil)))))
+      ;; Set up the timer, if configured.
+      (when poll-sleep-duration
+        (let [lease (acquire-timer! !poll-timer this tx-log opts)]
+          (.whenComplete fut (reify BiConsumer (accept [_ v e] (release-timer! !poll-timer lease))))))
 
       ;; Prime !latest-tx-id.
       (poll-for-tx! this tx-log)
@@ -168,8 +182,13 @@
       (notify-tx! this))))
 
 
-(def ^:private default-opts
+(def ^:private default-polling-opts
   {:poll-sleep-duration (Duration/ofMillis 200)})
+
+(def ^:private default-notifying-opts
+  {:poll-sleep-duration nil})
+
+(def ^:private default-opts default-polling-opts)
 
 
 (defn ->subscriber-handler
@@ -186,13 +205,22 @@
 
   ([opts]
    (let [opts (merge default-opts opts)]
-     (->SubscriberHandler (->latest-tx-id -1) opts))))
+     (->SubscriberHandler (->latest-tx-id) (->poll-timer) opts))))
 
 
 ;;
-;; Legacy
+;; Legacy APIs
 ;;
+
+(defn ->notifying-subscriber-handler
+  ([]
+   (->subscriber-handler default-notifying-opts))
+  ([_latest-submitted-tx]
+   (->notifying-subscriber-handler)))
+
+(defn handle-notifying-subscriber [subscriber-handler tx-log after-tx-id f]
+  (handle-subscriber subscriber-handler tx-log after-tx-id f))
 
 (defn handle-polling-subscription [tx-log after-tx-id opts f]
-  (-> (->subscriber-handler opts)
+  (-> (->subscriber-handler (merge default-polling-opts opts))
       (handle-subscriber tx-log after-tx-id f)))
