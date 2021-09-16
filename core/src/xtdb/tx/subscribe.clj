@@ -28,17 +28,6 @@
                            (.interrupt thread))))))))
 
 
-(defn- tx-handler [^CompletableFuture fut f]
-  (fn [_last-tx-id tx]
-    (f fut tx)
-
-    (let [tx-id (::xt/tx-id tx)]
-      (cond
-        (.isDone fut) (reduced tx-id)
-        (Thread/interrupted) (throw (InterruptedException.))
-        :else tx-id))))
-
-
 (defprotocol PLatestTxId
   "A synchronized box that tracks the latest submitted tx-id."
   (set-latest-tx-id! [this ^Long new-tx-id]
@@ -145,26 +134,40 @@
   (->PollTimer (ScheduledThreadPoolExecutor. 1) #{} nil))
 
 
+(defn- try-open-tx-log [tx-log after-tx-id]
+  (try
+    (db/open-tx-log tx-log after-tx-id)
+    (catch InterruptedException e (throw e))
+    (catch Exception e
+      (log/warn e "Error polling for txs, will retry soon."))))
+
+
+(defn- tx-handler [^CompletableFuture fut f]
+  (fn [_last-tx-id tx]
+    (f fut tx)
+    (cond-> (::xt/tx-id tx)
+      (.isDone fut) (reduced))))
+
+
 (defrecord SubscriberHandler [!latest-tx-id !poll-timer opts]
   PSubscriberHandler
   (handle-subscriber [this tx-log after-tx-id f]
-    (let [{:keys [poll-sleep-duration]} opts
-          ;; Start processing txs.
-          fut (completable-thread
+    (let [fut (completable-thread
                 (fn [^CompletableFuture fut]
                   (loop [after-tx-id after-tx-id]
                     (wait-for-tx-id !latest-tx-id after-tx-id)
-                    (let [last-tx-id (with-open [^ICursor log (db/open-tx-log tx-log after-tx-id)]
-                                         (reduce (tx-handler fut f)
-                                                 after-tx-id
-                                                 (iterator-seq log)))]
-                       (cond
-                         (.isDone fut) nil
-                         (Thread/interrupted) (throw (InterruptedException.))
-                         :else (recur last-tx-id))))))]
+                    (let [last-tx-id (when-some [log (try-open-tx-log tx-log after-tx-id)]
+                                       (with-open [^ICursor log log]
+                                         (reduce (tx-handler fut f) after-tx-id (iterator-seq log))))]
+                      (when-not (.isDone fut)
+                        (if last-tx-id
+                          (recur last-tx-id)
+                          ;; If we couldn't open the log, we'll give it a moment and keep trying.
+                          (do (Thread/sleep 200)
+                              (recur after-tx-id))))))))]
 
       ;; Set up the timer, if configured.
-      (when poll-sleep-duration
+      (when (:poll-sleep-duration opts)
         (let [lease (acquire-timer! !poll-timer this tx-log opts)]
           (.whenComplete fut (reify BiConsumer (accept [_ v e] (release-timer! !poll-timer lease))))))
 
