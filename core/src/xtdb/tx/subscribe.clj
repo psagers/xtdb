@@ -8,6 +8,7 @@
            [java.util.concurrent CompletableFuture]
            java.util.function.BiConsumer))
 
+
 (def ^java.util.concurrent.ThreadFactory subscription-thread-factory
   (xio/thread-factory "xtdb-tx-subscription"))
 
@@ -52,7 +53,7 @@
 
   (wait-for-tx-id [this after-tx-id timeout-ms]
     (locking this
-      (loop [after-tx-id after-tx-id]
+      (loop []
         (cond
           ;; If we know that there are new transactions, return immediately.
           (> tx-id after-tx-id)
@@ -68,7 +69,7 @@
           ;; after-tx-id.
           :else
           (do (.wait this)
-              (recur after-tx-id)))))))
+              (recur)))))))
 
 
 (defn ->latest-tx-id []
@@ -76,25 +77,19 @@
 
 
 (defprotocol PSubscriberHandler
-  ;; Logically, tx-log should be a property of the subscriber handler, but this
-  ;; creates circular references in practice. Passing different tx-log objects
-  ;; to the same subscriber handler will result in undefined behavior.
-  ;;
-  ;; XXX: Can we not use a weak reference or something? Having tx-log in the
-  ;; parameter list is a bit awkward.
   (handle-subscriber [this tx-log after-tx-id f]
                      "Starts a thread that will call f with tx records as they
                      become available. f takes a CompletableFuture, which can
-                     be used to halt the subscriber, and the next tx. Returns
-                     the CompletableFuture.")
+                     be used to halt the subscriber, and the next transaction
+                     record. Returns the CompletableFuture.")
 
   (notify-tx! [this tx]
-              "Notifies the handler of a transaction available on the tx-log.
-              TxLog backends can call this any time they successfully submit a
-              transaction, to immediately wake up the indexer. Some backends
-              may also wish to call this in response to their own asynchronous
-              notifications. Redundant and out-of-order transactions are
-              quietly ignored."))
+              "Notifies the handler of a transaction available on the tx-log
+              (only ::xt/tx-id is required). TxLog backends can call this any
+              time they successfully submit a transaction, to immediately wake
+              up the indexer. Some backends may also wish to call this in
+              response to their own asynchronous notifications. Redundant and
+              out-of-order transactions are quietly ignored."))
 
 
 (defn- try-open-tx-log [tx-log after-tx-id]
@@ -112,6 +107,11 @@
       (.isDone fut) (reduced))))
 
 
+;; Arguably, tx-log should be a property of the subscriber handler, but this
+;; creates circular references in practice. Passing different tx-logs to the
+;; same subscriber handler will result in undefined behavior.
+;;
+;; XXX: Could we compromise with a weak reference?
 (defrecord SubscriberHandler [!latest-tx-id opts]
   PSubscriberHandler
   (handle-subscriber [this tx-log after-tx-id f]
@@ -129,10 +129,10 @@
                         (.isDone fut)
                         nil
 
-                        ;; If we couldn't open the log, we'll give it a moment and keep trying.
+                        ;; If we couldn't open the log, we'll give it a moment and try again.
                         (nil? last-tx-id)
-                        (do (Thread/sleep 500)  ;; XXX: What should this be?
-                            (recur after-tx-id true))
+                        (do (Thread/sleep (or poll-timeout-ms 500))  ;; XXX: What should this be?
+                            (recur after-tx-id false))
 
                         ;; Non-empty result: report last-tx-id and loop immediately.
                         (> last-tx-id after-tx-id)
@@ -143,7 +143,7 @@
                         :else
                         (recur last-tx-id true))))))]
 
-      ;; Prime !latest-tx-id.
+      ;; Make sure !latest-tx-id is primed.
       (when-some [tx (db/latest-submitted-tx tx-log)]
         (notify-tx! this tx))
 
@@ -170,7 +170,8 @@
 
     :poll-sleep-duration (java.time.Duration): time between polling for new
       transactions. Defaults to 200 ms. Set to nil to disable polling entirely;
-      in this case, the client is entirely responsible for calling notify-tx!."
+      in this case, the client is solely responsible for calling notify-tx! as
+      needed."
   ([]
    (->subscriber-handler {}))
 
