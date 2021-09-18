@@ -5,7 +5,7 @@
             [xtdb.io :as xio])
   (:import xtdb.api.ICursor
            java.time.Duration
-           [java.util.concurrent CompletableFuture ScheduledFuture ScheduledThreadPoolExecutor TimeUnit]
+           [java.util.concurrent CompletableFuture]
            java.util.function.BiConsumer))
 
 (def ^java.util.concurrent.ThreadFactory subscription-thread-factory
@@ -33,14 +33,14 @@
   (set-latest-tx-id! [this ^Long new-tx-id]
                      "Updates the latest tx-id value iff new-tx-id is higher
                      than the current value.")
-  (wait-for-tx-id [this ^Long after-tx-id]
-                  "Blocks the calling thread until the latest tx-id is higher
-                  than after-tx-id. Returns the latest tx-id."))
+
+  (wait-for-tx-id [this ^Long after-tx-id timeout-ms]
+                  "Blocks the calling thread until either the latest tx-id is
+                  higher than after-tx-id or the (optional) timeout expires.
+                  Returns the latest tx-id that we know about."))
 
 
-;; Essentially a tx-id behind a Lock/Condition. This plays nicely with
-;; completable threads, as interrupting the thread will pop us out of
-;; Object.wait() with an InterruptedException.
+;; A tx-id behind a Lock/Condition.
 (deftype LatestTxId [^:volatile-mutable tx-id]
   PLatestTxId
   (set-latest-tx-id! [this new-tx-id]
@@ -50,31 +50,38 @@
         (.notifyAll this))
       tx-id))
 
-  (wait-for-tx-id [this after-tx-id]
+  (wait-for-tx-id [this after-tx-id timeout-ms]
     (locking this
-      (loop [after-tx-id (or after-tx-id -1)]
-        (if (> tx-id after-tx-id)
-         tx-id
-         (do
-           (.wait this)
-           (recur after-tx-id)))))))
+      (loop [after-tx-id after-tx-id]
+        (cond
+          ;; If we know that there are new transactions, return immediately.
+          (> tx-id after-tx-id)
+          tx-id
+
+          ;; If we have a timeout, wait at most that length of time. We don't
+          ;; bother detecting early or spurious wakeups.
+          timeout-ms
+          (do (.wait this timeout-ms)
+              tx-id)
+
+          ;; With no timeout, wait indefinitely for tx-id to exceed
+          ;; after-tx-id.
+          :else
+          (do (.wait this)
+              (recur after-tx-id)))))))
 
 
-(defn ->latest-tx-id
-  ([]
-   (->latest-tx-id -1))
-  ([tx-id]
-   (->LatestTxId tx-id)))
+(defn ->latest-tx-id []
+  (->LatestTxId -1))
 
 
-;; Note that some of these methods take a tx-log argument. Logically, this
-;; should be a property of the subscriber handler, but this creates circular
-;; references in practice. Passing different tx-log objects to the same
-;; subscriber handler will result in undefined behavior.
-;;
-;; XXX: Can we not use a weak reference or something? Having tx-log in the
-;; parameter lists is weird in principle and awkward in practice.
 (defprotocol PSubscriberHandler
+  ;; Logically, tx-log should be a property of the subscriber handler, but this
+  ;; creates circular references in practice. Passing different tx-log objects
+  ;; to the same subscriber handler will result in undefined behavior.
+  ;;
+  ;; XXX: Can we not use a weak reference or something? Having tx-log in the
+  ;; parameter list is a bit awkward.
   (handle-subscriber [this tx-log after-tx-id f]
                      "Starts a thread that will call f with tx records as they
                      become available. f takes a CompletableFuture, which can
@@ -82,56 +89,12 @@
                      the CompletableFuture.")
 
   (notify-tx! [this tx]
-              "Notifies the handler of the latest transaction available on the
-              tx-log. Embedded implementations and those that are able to
-              receive notifications from their backends may call this any time
-              a new transaction has been recorded.")
-
-  (poll-for-tx! [this tx-log]
-                "Polls the tx-log for the latest submited tx and calls
-                notify-tx!. This is normally called internally, but clients are
-                welcome to set up their own polling loops if they so desire."))
-
-
-(defprotocol PPollTimer
-  (acquire-timer! [this handler tx-log opts]
-                  "Ensures that this polling timer is running. Returns a lease
-                  value that must be presented later to release-timer!.")
-
-  (release-timer! [this lease]
-                  "Balances a previous call to acquire-timer! When all leases
-                  are released, the timer is canceled."))
-
-
-;; In pure Clojure, I might do this with an agent. XT seems to prefer Java
-;; concurrency primitives, so we'll do it the Java way.
-(deftype PollTimer [^ScheduledThreadPoolExecutor executor, ^:volatile-mutable leases, ^:volatile-mutable ^ScheduledFuture fut]
-  PPollTimer
-  (acquire-timer! [this handler tx-log {:keys [^Duration poll-sleep-duration]}]
-    (locking this
-      (let [lease (gensym "poll-lease-")]
-        (set! leases (conj leases lease))
-        (when (nil? fut)
-          (set! fut (.scheduleWithFixedDelay executor
-                                             (reify Runnable (run [_] (poll-for-tx! handler tx-log)))
-                                             (.toMillis poll-sleep-duration)
-                                             (.toMillis poll-sleep-duration)
-                                             TimeUnit/MILLISECONDS)))
-        lease)))
-
-  (release-timer! [this lease]
-    (locking this
-      (if-not (leases lease)
-        (log/warn (str "Timer lease not found: " lease))
-        (do
-          (set! leases (disj leases lease))
-          (when (and (empty? leases) (some? fut))
-            (.cancel fut false)
-            (set! fut nil)))))))
-
-
-(defn ->poll-timer []
-  (->PollTimer (ScheduledThreadPoolExecutor. 1) #{} nil))
+              "Notifies the handler of a transaction available on the tx-log.
+              TxLog backends can call this any time they successfully submit a
+              transaction, to immediately wake up the indexer. Some backends
+              may also wish to call this in response to their own asynchronous
+              notifications. Redundant and out-of-order invocations are quietly
+              ignored."))
 
 
 (defn- try-open-tx-log [tx-log after-tx-id]
@@ -149,40 +112,46 @@
       (.isDone fut) (reduced))))
 
 
-(defrecord SubscriberHandler [!latest-tx-id !poll-timer opts]
+(defrecord SubscriberHandler [!latest-tx-id opts]
   PSubscriberHandler
   (handle-subscriber [this tx-log after-tx-id f]
-    (let [fut (completable-thread
+    (let [poll-timeout-ms (some-> ^Duration (:poll-sleep-duration opts) (.toMillis))
+          fut (completable-thread
                 (fn [^CompletableFuture fut]
-                  (loop [after-tx-id after-tx-id]
-                    (wait-for-tx-id !latest-tx-id after-tx-id)
+                  (loop [after-tx-id (or after-tx-id -1)
+                         wait? true]
+                    (when wait?
+                      (wait-for-tx-id !latest-tx-id after-tx-id poll-timeout-ms))
                     (let [last-tx-id (when-some [log (try-open-tx-log tx-log after-tx-id)]
                                        (with-open [^ICursor log log]
                                          (reduce (tx-handler fut f) after-tx-id (iterator-seq log))))]
-                      (when-not (.isDone fut)
-                        (if last-tx-id
-                          (recur last-tx-id)
-                          ;; If we couldn't open the log, we'll give it a moment and keep trying.
-                          (do (Thread/sleep 200)
-                              (recur after-tx-id))))))))]
+                      (cond
+                        (.isDone fut)
+                        nil
 
-      ;; Set up the timer, if configured.
-      (when (:poll-sleep-duration opts)
-        (let [lease (acquire-timer! !poll-timer this tx-log opts)]
-          (.whenComplete fut (reify BiConsumer (accept [_ v e] (release-timer! !poll-timer lease))))))
+                        ;; If we couldn't open the log, we'll give it a moment and keep trying.
+                        (nil? last-tx-id)
+                        (do (Thread/sleep 500)  ;; XXX: What should this be?
+                            (recur after-tx-id true))
+
+                        ;; Non-empty result: report last-tx-id and loop immediately.
+                        (> last-tx-id after-tx-id)
+                        (do (set-latest-tx-id! !latest-tx-id last-tx-id)
+                            (recur last-tx-id false))
+
+                        ;; Empty result: wait for more.
+                        :else
+                        (recur last-tx-id true))))))]
 
       ;; Prime !latest-tx-id.
-      (poll-for-tx! this tx-log)
+      (when-some [tx (db/latest-submitted-tx tx-log)]
+        (notify-tx! this tx))
 
       fut))
 
   (notify-tx! [_ {::xt/keys [tx-id]}]
     (when (nat-int? tx-id)
-      (set-latest-tx-id! !latest-tx-id tx-id)))
-
-  (poll-for-tx! [this tx-log]
-    (some->> (db/latest-submitted-tx tx-log)
-      (notify-tx! this))))
+      (set-latest-tx-id! !latest-tx-id tx-id))))
 
 
 (def ^:private default-polling-opts
@@ -208,7 +177,7 @@
 
   ([opts]
    (let [opts (merge default-opts opts)]
-     (->SubscriberHandler (->latest-tx-id) (->poll-timer) opts))))
+     (->SubscriberHandler (->latest-tx-id) opts))))
 
 
 ;;

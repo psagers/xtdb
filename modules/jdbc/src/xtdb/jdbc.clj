@@ -35,6 +35,7 @@
 
 (defmethod <-blob ::default [v _] (nippy/thaw v))
 
+
 (defrecord HikariConnectionPool [^HikariDataSource pool dialect]
   Closeable
   (close [_]
@@ -136,11 +137,12 @@
           :document-cache document-cache
           :document-store (->JdbcDocumentStore pool dialect))))
 
-(defrecord JdbcTxLog [pool dialect ^Closeable tx-consumer]
+(defrecord JdbcTxLog [pool dialect tx-consumer subscriber-handler]
   db/TxLog
   (submit-tx [_ tx-events]
     (let [tx (-> (insert-event! pool nil tx-events "txs")
                  (tx-result->tx-data pool dialect))]
+      (tx-sub/notify-tx! subscriber-handler tx)
       (delay tx)))
 
   (open-tx-log [_ after-tx-id]
@@ -157,7 +159,7 @@
                                  ::txe/tx-events (-> (:v y) (<-blob dialect))}))))))
 
   (subscribe [this after-tx-id f]
-    (tx-sub/handle-polling-subscription this after-tx-id {:poll-sleep-duration (Duration/ofMillis 100)} f))
+    (tx-sub/handle-subscriber subscriber-handler this after-tx-id f))
 
   (latest-submitted-tx [_]
     (when-let [max-offset (-> (jdbc/execute-one! pool ["SELECT max(EVENT_OFFSET) AS max_offset FROM tx_events WHERE topic = 'txs'"]
@@ -167,8 +169,11 @@
 
   Closeable
   (close [_]
-    (xio/try-close tx-consumer)))
+    (run! xio/try-close [tx-consumer subscriber-handler])))
 
+;; FIXME: poll-sleep-duration is supposed to be configurable.
 (defn ->tx-log {::sys/deps {:connection-pool `->connection-pool}}
   [{{:keys [pool dialect]} :connection-pool}]
-  (map->JdbcTxLog {:pool pool, :dialect dialect}))
+  (map->JdbcTxLog {:pool pool
+                   :dialect dialect
+                   :subscriber-handler (tx-sub/->subscriber-handler {:poll-sleep-duration (Duration/ofMillis 100)})}))
