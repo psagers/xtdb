@@ -93,8 +93,8 @@
               TxLog backends can call this any time they successfully submit a
               transaction, to immediately wake up the indexer. Some backends
               may also wish to call this in response to their own asynchronous
-              notifications. Redundant and out-of-order invocations are quietly
-              ignored."))
+              notifications. Redundant and out-of-order transactions are
+              quietly ignored."))
 
 
 (defn- try-open-tx-log [tx-log after-tx-id]
@@ -170,8 +170,7 @@
 
     :poll-sleep-duration (java.time.Duration): time between polling for new
       transactions. Defaults to 200 ms. Set to nil to disable polling entirely;
-      in this case, the client is entirely responsible for calling notify-tx!
-      and/or poll-for-tx!."
+      in this case, the client is entirely responsible for calling notify-tx!."
   ([]
    (->subscriber-handler {}))
 

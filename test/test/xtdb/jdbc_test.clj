@@ -81,6 +81,15 @@
                                               {:builder-fn jdbcr/as-unqualified-lower-maps}))))))
   (t/is true))
 
+(t/deftest test-latency-bench
+  (when (Boolean/parseBoolean (System/getenv "XTDB_JDBC_PERFORMANCE"))
+    (print "test-latency-bench - ")
+    (time
+      (dotimes [n 100]
+        (->> (xt/submit-tx *api* [[::xt/put {:xt/id (keyword (str n))}]])
+             (xt/await-tx *api*)))))
+  (t/is true))
+
 (t/deftest test-project-star-bug-1016
   (fix/submit+await-tx [[::xt/put {:xt/id :put
                                    :xt/fn '(fn [ctx doc]
