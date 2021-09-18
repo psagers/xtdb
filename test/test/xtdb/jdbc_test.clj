@@ -69,7 +69,7 @@
          (reset! last-tx (xt/submit-tx *api* [[::xt/put {:xt/id (keyword (str n))}]]))))
 
       (time
-       (xt/await-tx *api* last-tx nil))))
+       (xt/await-tx *api* @last-tx nil))))
   (t/is true))
 
 (t/deftest test-ingest-bench
@@ -79,6 +79,15 @@
                 (:num_docs (jdbc/execute-one! (:pool (:tx-log *api*))
                                               ["SELECT count(EVENT_KEY) AS num_docs FROM tx_events WHERE TOPIC = 'docs'"]
                                               {:builder-fn jdbcr/as-unqualified-lower-maps}))))))
+  (t/is true))
+
+(t/deftest test-latency-bench
+  (when (Boolean/parseBoolean (System/getenv "XTDB_JDBC_PERFORMANCE"))
+    (print "test-latency-bench - ")
+    (time
+      (dotimes [n 100]
+        (->> (xt/submit-tx *api* [[::xt/put {:xt/id (keyword (str n))}]])
+             (xt/await-tx *api*)))))
   (t/is true))
 
 (t/deftest test-project-star-bug-1016
